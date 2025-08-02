@@ -17,7 +17,6 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel.h>
 #include <zephyr/types.h>
-#include <dk_buttons_and_leds.h>
 #if defined(CONFIG_CLOCK_CONTROL_NRF2)
 #include <hal/nrf_lrcconf.h>
 #endif
@@ -181,17 +180,6 @@ int esb_initialize(void)
 	return 0;
 }
 
-static void leds_update(uint8_t value)
-{
-	uint32_t leds_mask =
-		(!(value % 8 > 0 && value % 8 <= 4) ? DK_LED1_MSK : 0) |
-		(!(value % 8 > 1 && value % 8 <= 5) ? DK_LED2_MSK : 0) |
-		(!(value % 8 > 2 && value % 8 <= 6) ? DK_LED3_MSK : 0) |
-		(!(value % 8 > 3) ? DK_LED4_MSK : 0);
-
-	dk_set_leds(leds_mask);
-}
-
 int main(void)
 {
 	int err;
@@ -200,12 +188,6 @@ int main(void)
 
 	err = clocks_start();
 	if (err) {
-		return 0;
-	}
-
-	err = dk_leds_init();
-	if (err) {
-		LOG_ERR("LEDs initialization failed, err %d", err);
 		return 0;
 	}
 
@@ -223,7 +205,6 @@ int main(void)
 		if (ready) {
 			ready = false;
 			esb_flush_tx();
-			leds_update(tx_payload.data[1]);
 
 			err = esb_write_payload(&tx_payload);
 			if (err) {
