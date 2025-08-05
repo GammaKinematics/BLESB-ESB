@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2018 Nordic Semiconductor ASA
- *
+ * Copyright (c) 2024 GammaKinematics - UART to ESB Bridge
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 #include <zephyr/drivers/clock_control.h>
@@ -8,7 +8,9 @@
 #if defined(NRF54L15_XXAA)
 #include <hal/nrf_clock.h>
 #endif /* defined(NRF54L15_XXAA) */
+#include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/sys/ring_buffer.h>
 #include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
 #include <nrf.h>
@@ -21,44 +23,128 @@
 #include <hal/nrf_lrcconf.h>
 #endif
 
-LOG_MODULE_REGISTER(esb_ptx, CONFIG_ESB_PTX_APP_LOG_LEVEL);
+LOG_MODULE_REGISTER(esb_uart_bridge, CONFIG_ESB_PTX_APP_LOG_LEVEL);
 
-static bool ready = true;
-static struct esb_payload rx_payload;
-static struct esb_payload tx_payload = ESB_CREATE_PAYLOAD(0,
-	0x01, 0x00, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08);
+/* HID packet structure for UART→ESB transport */
+struct hid_packet_header {
+    uint8_t type;      /* HID report type (1=keyboard, 2=consumer, 3=mouse) */
+    uint8_t length;    /* Payload length */
+} __packed;
 
-#define _RADIO_SHORTS_COMMON                                                   \
-	(RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk |         \
-	 RADIO_SHORTS_ADDRESS_RSSISTART_Msk |                                  \
-	 RADIO_SHORTS_DISABLED_RSSISTOP_Msk)
+#define HID_TYPE_KEYBOARD   1
+#define HID_TYPE_CONSUMER   2  
+#define HID_TYPE_MOUSE      3
+#define MAX_HID_PAYLOAD     28  /* ESB max (32) - header (4) */
 
+/* UART device from device tree */
+static const struct device *uart_dev = DEVICE_DT_GET(DT_CHOSEN(zephyr_bt_c2h_uart));
+
+/* UART ring buffer for incoming data */
+#define UART_BUF_SIZE 512
+static uint8_t uart_buffer[UART_BUF_SIZE];
+static struct ring_buf uart_ring_buf;
+
+/* ESB payload for forwarding */
+static struct esb_payload tx_payload;
+static bool esb_ready = true;
+
+/* ESB event handler */
 void event_handler(struct esb_evt const *event)
 {
-	ready = true;
-
-	switch (event->evt_id) {
-	case ESB_EVENT_TX_SUCCESS:
-		LOG_DBG("TX SUCCESS EVENT");
-		break;
-	case ESB_EVENT_TX_FAILED:
-		LOG_DBG("TX FAILED EVENT");
-		break;
-	case ESB_EVENT_RX_RECEIVED:
-		while (esb_read_rx_payload(&rx_payload) == 0) {
-			LOG_DBG("Packet received, len %d : "
-				"0x%02x, 0x%02x, 0x%02x, 0x%02x, "
-				"0x%02x, 0x%02x, 0x%02x, 0x%02x",
-				rx_payload.length, rx_payload.data[0],
-				rx_payload.data[1], rx_payload.data[2],
-				rx_payload.data[3], rx_payload.data[4],
-				rx_payload.data[5], rx_payload.data[6],
-				rx_payload.data[7]);
-		}
-		break;
-	}
+    switch (event->evt_id) {
+    case ESB_EVENT_TX_SUCCESS:
+        LOG_DBG("ESB TX success");
+        esb_ready = true;
+        break;
+    case ESB_EVENT_TX_FAILED:
+        LOG_WRN("ESB TX failed");
+        esb_ready = true;  /* Try again anyway */
+        break;
+    case ESB_EVENT_RX_RECEIVED:
+        /* Not expecting RX in PTX mode */
+        break;
+    }
 }
 
+/* UART interrupt handler */
+static void uart_isr(const struct device *dev, void *user_data)
+{
+    uint8_t byte;
+    
+    if (!uart_irq_update(dev)) {
+        return;
+    }
+    
+    if (uart_irq_rx_ready(dev)) {
+        while (uart_fifo_read(dev, &byte, 1) == 1) {
+            ring_buf_put(&uart_ring_buf, &byte, 1);
+        }
+    }
+}
+
+/* Process received HID packet from UART */
+static void process_hid_packet(const uint8_t *data, size_t len)
+{
+    if (len < sizeof(struct hid_packet_header)) {
+        LOG_WRN("Packet too short: %zu", len);
+        return;
+    }
+    
+    struct hid_packet_header *header = (struct hid_packet_header *)data;
+    
+    if (header->length > MAX_HID_PAYLOAD) {
+        LOG_WRN("Payload too large: %d", header->length);
+        return;
+    }
+    
+    if (len != sizeof(struct hid_packet_header) + header->length) {
+        LOG_WRN("Length mismatch: got %zu, expected %zu", 
+                len, sizeof(struct hid_packet_header) + header->length);
+        return;
+    }
+    
+    /* Package into ESB payload */
+    tx_payload.length = len;
+    tx_payload.pipe = 0;
+    tx_payload.noack = false;
+    memcpy(tx_payload.data, data, len);
+    
+    /* Send via ESB if ready */
+    if (esb_ready) {
+        esb_ready = false;
+        int err = esb_write_payload(&tx_payload);
+        if (err) {
+            LOG_ERR("ESB write failed: %d", err);
+            esb_ready = true;
+        } else {
+            LOG_DBG("Forwarded HID packet: type=%d, len=%d", 
+                    header->type, header->length);
+        }
+    } else {
+        LOG_WRN("ESB busy, dropping packet");
+    }
+}
+
+/* UART initialization */
+static int uart_init(void)
+{
+    if (!device_is_ready(uart_dev)) {
+        LOG_ERR("UART device not ready");
+        return -ENODEV;
+    }
+    
+    /* Initialize ring buffer */
+    ring_buf_init(&uart_ring_buf, sizeof(uart_buffer), uart_buffer);
+    
+    /* Configure UART interrupts */
+    uart_irq_callback_set(uart_dev, uart_isr);
+    uart_irq_rx_enable(uart_dev);
+    
+    LOG_INF("UART initialized for PRIM communication");
+    return 0;
+}
+
+/* Keep existing clock initialization functions */
 #if defined(CONFIG_CLOCK_CONTROL_NRF)
 int clocks_start(void)
 {
@@ -89,11 +175,6 @@ int clocks_start(void)
 		}
 	} while (err);
 
-#if defined(NRF54L15_XXAA)
-	/* MLTPAN-20 */
-	nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_PLLSTART);
-#endif /* defined(NRF54L15_XXAA) */
-
 	LOG_DBG("HF clock started");
 	return 0;
 }
@@ -108,7 +189,6 @@ int clocks_start(void)
 		DEVICE_DT_GET_OR_NULL(DT_CLOCKS_CTLR(DT_NODELABEL(radio)));
 	struct onoff_client radio_cli;
 
-	/** Keep radio domain powered all the time to reduce latency. */
 	nrf_lrcconf_poweron_force_set(NRF_LRCCONF010, NRF_LRCCONF_POWER_DOMAIN_1, true);
 
 	sys_notify_init_spinwait(&radio_cli.notify);
@@ -134,6 +214,7 @@ int clocks_start(void)
 BUILD_ASSERT(false, "No Clock Control driver");
 #endif /* defined(CONFIG_CLOCK_CONTROL_NRF2) */
 
+/* Keep existing ESB initialization */
 int esb_initialize(void)
 {
 	int err;
@@ -180,38 +261,64 @@ int esb_initialize(void)
 	return 0;
 }
 
+/* New main function with UART bridge */
 int main(void)
 {
-	int err;
-
-	LOG_INF("Enhanced ShockBurst ptx sample");
-
-	err = clocks_start();
-	if (err) {
-		return 0;
-	}
-
-	err = esb_initialize();
-	if (err) {
-		LOG_ERR("ESB initialization failed, err %d", err);
-		return 0;
-	}
-
-	LOG_INF("Initialization complete");
-	LOG_INF("Sending test packet");
-
-	tx_payload.noack = false;
-	while (1) {
-		if (ready) {
-			ready = false;
-			esb_flush_tx();
-
-			err = esb_write_payload(&tx_payload);
-			if (err) {
-				LOG_ERR("Payload write failed, err %d", err);
-			}
-			tx_payload.data[1]++;
-		}
-		k_sleep(K_MSEC(100));
-	}
+    int err;
+    
+    LOG_INF("BLESB UART→ESB Bridge starting");
+    
+    /* Initialize clocks */
+    err = clocks_start();
+    if (err) {
+        LOG_ERR("Clock start failed: %d", err);
+        return 0;
+    }
+    
+    /* Initialize ESB */
+    err = esb_initialize();
+    if (err) {
+        LOG_ERR("ESB initialization failed: %d", err);
+        return 0;
+    }
+    
+    /* Initialize UART */
+    err = uart_init();
+    if (err) {
+        LOG_ERR("UART initialization failed: %d", err);
+        return 0;
+    }
+    
+    LOG_INF("Bridge initialization complete");
+    
+    /* Main packet processing loop */
+    uint8_t packet_buffer[64];
+    size_t packet_len = 0;
+    
+    while (1) {
+        /* Check for complete packets in ring buffer */
+        if (ring_buf_size_get(&uart_ring_buf) >= sizeof(struct hid_packet_header)) {
+            struct hid_packet_header header;
+            
+            /* Peek at header */
+            if (ring_buf_peek(&uart_ring_buf, (uint8_t *)&header, sizeof(header)) == sizeof(header)) {
+                size_t total_len = sizeof(header) + header.length;
+                
+                /* Check if complete packet is available */
+                if (ring_buf_size_get(&uart_ring_buf) >= total_len && total_len <= sizeof(packet_buffer)) {
+                    /* Get complete packet */
+                    packet_len = ring_buf_get(&uart_ring_buf, packet_buffer, total_len);
+                    
+                    if (packet_len == total_len) {
+                        process_hid_packet(packet_buffer, packet_len);
+                    }
+                }
+            }
+        }
+        
+        /* Small delay to prevent busy waiting */
+        k_sleep(K_USEC(100));
+    }
+    
+    return 0;
 }
